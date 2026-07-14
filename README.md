@@ -15,6 +15,9 @@ uv run uvicorn app.main:app --reload
 `LLM_API_KEY` is used with the default Gemini OpenAI-compatible endpoint.
 If you swap providers, update `llm_base_url` and `llm_model` in `app/config.py`.
 
+Logs are written to `logs/app.log` (general application logs) and `logs/http_access.log`
+(HTTP request access logs). Both use rotating file handlers
+
 ## Try it
 
 ```bash
@@ -31,9 +34,16 @@ curl -X POST http://localhost:8000/api/v1/analyze \
 - **Fixed a scoring bug**: the old PR count measured PRs merged *into the user's own
   repos*, not PRs the user actually authored. It now uses
   `contributionsCollection.totalPullRequestContributions`.
-- **`ai_service`** returns structured `tips` (issue / action / impact) instead of a
-  single prose string, and uses `AsyncOpenAI` against a Gemini-compatible endpoint
-  so the LLM call no longer blocks the FastAPI event loop.
+- **`ai_service`** now accepts both `pinned_repos` and `recent_repos`. If a profile has
+  no pinned repos, the AI scorer falls back to judging the most recent repos instead,
+  providing actionable feedback on what to pin. Uses `AsyncOpenAI` against a
+  Gemini-compatible endpoint so the LLM call no longer blocks the FastAPI event loop.
+  Returns structured `tips` (issue / action / impact) instead of a single prose string.
+- **Logging** now writes to two rotating log files:
+  - `logs/app.log`: general application logs (INFO/WARNING/ERROR from all modules)
+  - `logs/http_access.log`: HTTP request access logs (Apache combined format)
+- **HTTP access logging** via `AccessLogMiddleware` — every request is logged with client IP,
+  method, path, query string, status code, duration, and user-agent.
 - **`github_service`** raises typed exceptions (`GithubUserNotFoundError`,
   `GithubApiError`) instead of throwing raw `KeyError`s or 404-ing on every failure
   mode, and retries transient failures (timeouts, 429, 5xx) with backoff via `tenacity`.
@@ -41,15 +51,15 @@ curl -X POST http://localhost:8000/api/v1/analyze \
   `torvalds` share a cache entry instead of silently doubling your miss rate.
 - Split into `config.py` / `schemas.py` / `services/` / `core/` per the structure
   discussed — `github_service.py`, `scoring_service.py`, and `core/cache.py` are meant
-  to be the stable layer; `ai_service.py` is the seam where you'll swap in your
-  production LLM later.
+  to be the stable layer.
 
 ## Known limitations worth knowing about (not fixed here)
 
 - `profile_cache` is in-process memory (`TTLCache`). Fine for one instance.
-- No persistence. If you want users to track score improvement over time (a natural
-  upsell for a job-tracking SaaS), you'll want to write each `AnalyzeResponse` to
-  Postgres keyed by user + timestamp, probably in `main.py` right after scoring.
-- No per-user rate limiting / tiering 
-- README matching only tries `README.md` and `readme.md` at the repo root — it will
+- No persistence. If you want users to track score improvement over time.
+- **Logging**: `RotatingFileHandler` is not safe across multiple OS processes writing the
+  same file concurrently. Fine for `uvicorn --reload`'s single worker, or a single gunicorn
+  worker. For multi-worker deployments, either give each worker its own log file (suffix by
+  PID), switch to `QueueHandler` + a listener process, or ship logs to a centralized service.
+- README matching only tries `README.md` and `readme.md` at the repo root. It will
   miss READMEs with other casings/paths.
