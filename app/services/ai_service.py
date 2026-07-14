@@ -14,6 +14,11 @@ Changes that matter in production:
   4. `_ai_degraded` sentinel on the returned dict. main.py checks this before
      writing to the cache — a transient LLM outage should never get cached
      as if it were a real result for 48 hours.
+  5. Takes BOTH pinned_repos and recent_repos. A profile with nothing pinned
+     used to get a canned "pin some projects" message and a zeroed cognitive
+     score — now it falls back to judging the most recent repos instead. And
+     even when pinned_repos isn't empty, recent-but-unpinned repos are still
+     passed along so the model can flag one worth pinning by name.
 
 Previously ran against NVIDIA NIM's deepseek-v4-flash, which required NIM's
 non-standard `extra_body.chat_template_kwargs` to control thinking and was
@@ -39,19 +44,39 @@ _client = AsyncOpenAI(
     timeout=_settings.llm_request_timeout,
 )
 
+_MAX_OTHER_REPOS = 6
+
 _SYSTEM_PROMPT = """\
 You are a senior technical recruiter reviewing a GitHub profile for a {role} role.
 
-Score the developer's pinned repositories:
+You are given two lists:
+- "pinned_repos": the repos the candidate has chosen to showcase on their profile.
+  This list may be EMPTY if the candidate hasn't pinned anything.
+- "other_recent_repos": some of the candidate's other recent, non-fork repos that
+  are NOT currently pinned. This list may also be empty.
+
+Score the profile's showcase quality:
 1. Technical Complexity (0-25): basic tutorials or copy-paste clones score low;
    original systems, non-trivial architecture, or real infrastructure score high.
 2. Originality (0-25): standard bootcamp/course clones score low; a unique
    problem or unusual approach scores high.
 
-Also produce 2-4 concrete, actionable tips the candidate could act on this week.
-Every tip must reference something specific you actually observed (a repo name,
-a missing README, a missing license, a thin description) — no generic advice
-like "write more code" or "contribute to open source."
+If pinned_repos is non-empty, base these two scores on pinned_repos — that's what a
+recruiter actually sees first. If pinned_repos is EMPTY, base the scores on the
+strongest repos in other_recent_repos instead, and say plainly in ai_insight that
+the candidate hasn't pinned anything yet and this score reflects their recent work.
+
+Separately, look at other_recent_repos and decide whether any of them would
+meaningfully strengthen the profile if pinned — because it's more complex, better
+documented, or more relevant to the {role} role than what's currently pinned, or
+because nothing is pinned at all. If so, include a tip recommending the candidate
+pin it, naming the specific repo. Don't force this if nothing in other_recent_repos
+is actually an improvement.
+
+Produce 2-4 concrete, actionable tips total, covering both showcase-quality issues
+and any pin recommendation. Every tip must reference something specific you actually
+observed (a repo name, a missing README, a missing license, a thin description) — no
+generic advice like "write more code" or "contribute to open source."
 
 Return ONLY valid JSON, no markdown fences, exactly matching this shape:
 {{
@@ -118,15 +143,32 @@ def _prune_repo(repo: dict) -> dict:
     }
 
 
-async def get_cognitive_score(pinned_repos: list[dict], target_role: str | None) -> dict:
-    if not pinned_repos:
+def _unpinned_recent(pinned_repos: list[dict], recent_repos: list[dict]) -> list[dict]:
+    """
+    recent_repos can legitimately include repos that are also pinned (pinned repos
+    are usually recently pushed too) — filter those out so the model isn't asked to
+    "recommend pinning" something that's already pinned.
+    """
+    pinned_names = {r.get("name") for r in pinned_repos}
+    return [r for r in recent_repos if r.get("name") not in pinned_names][:_MAX_OTHER_REPOS]
+
+
+async def get_cognitive_score(
+    pinned_repos: list[dict], recent_repos: list[dict], target_role: str | None
+) -> dict:
+    other_recent = _unpinned_recent(pinned_repos, recent_repos)
+
+    if not pinned_repos and not other_recent:
         return {
             **_FALLBACK,
-            "ai_insight": "No pinned repos to analyze — pin 4-6 of your strongest projects first.",
-            "_ai_degraded": False,  # true result, not a failure — fine to cache
+            "ai_insight": "No repositories to analyze yet — push some work and pin your best projects.",
+            "_ai_degraded": False,
         }
 
-    pruned = [_prune_repo(r) for r in pinned_repos]
+    payload = {
+        "pinned_repos": [_prune_repo(r) for r in pinned_repos],
+        "other_recent_repos": [_prune_repo(r) for r in other_recent],
+    }
     role_label = target_role or "general software engineering"
 
     try:
@@ -134,7 +176,7 @@ async def get_cognitive_score(pinned_repos: list[dict], target_role: str | None)
             model=_settings.llm_model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT.format(role=role_label)},
-                {"role": "user", "content": json.dumps(pruned)},
+                {"role": "user", "content": json.dumps(payload)},
             ],
             temperature=_settings.llm_temperature,
             top_p=_settings.llm_top_p,
@@ -144,7 +186,6 @@ async def get_cognitive_score(pinned_repos: list[dict], target_role: str | None)
         )
         message = response.choices[0].message
 
-        # Reasoning trace is useful for debugging/prompt-tuning during dev — log it,
         reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
         if reasoning:
             logger.debug("LLM reasoning trace: %s", reasoning)
@@ -155,9 +196,9 @@ async def get_cognitive_score(pinned_repos: list[dict], target_role: str | None)
         parsed.setdefault("_ai_degraded", False)
         return parsed
     except (json.JSONDecodeError, KeyError, IndexError, AttributeError) as exc:
+        # Model returned something we couldn't parse as the expected JSON shape.
         logger.warning("LLM response did not match expected shape: %s", exc)
         return _FALLBACK
-    except Exception as exc:  # noqa: BLE001 — deliberately broad: any NIM/network failure
-        # should degrade to the math score, never take the whole request down.
+    except Exception as exc:  # noqa: BLE001 — deliberately broad: any provider/network failure
         logger.warning("LLM call failed: %s", exc)
         return _FALLBACK
